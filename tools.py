@@ -6,6 +6,7 @@ import json
 import logging
 import time
 import zlib
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
@@ -54,7 +55,8 @@ def load_operations(session: Session) -> list[dict]:
     with open(session.statement_path, encoding="utf-8", newline="") as f:
         return [
             {"op_id": r["op_id"], "date": date.fromisoformat(r["date"]),
-             "amount_rub": float(r["amount_rub"]), "merchant": r["merchant"],
+             "amount_rub": Decimal(r["amount_rub"]).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+             "merchant": r["merchant"],
              "category": r["category"]}
             for r in csv.DictReader(f) if r["account_id"] == session.account_id
         ]
@@ -91,25 +93,31 @@ class FlagSubscription(BaseModel):
 
 # ---------- функции инструментов ----------
 
-def _sub_id(merchant: str) -> str:
-    return f"sub_{zlib.crc32(merchant.encode()):08x}"
+def _sub_id(merchant: str, amount_rub: Decimal | float | int) -> str:
+    """ID платёжной серии: один merchant может иметь несколько тарифов."""
+    amount = Decimal(str(amount_rub)).quantize(Decimal("0.01"))
+    key = f"{merchant}|{amount:.2f}"
+    return f"sub_{zlib.crc32(key.encode()):08x}"
 
 
 def get_spending_summary(args: GetSpendingSummary, session: Session) -> dict:
+    # В нашем синтетическом CSV: amount_rub > 0 — расход, < 0 — поступление.
+    # Не смешиваем входящие переводы с тратами.
     ops = [o for o in load_operations(session)
            if args.date_from <= o["date"] <= args.date_to
+           and o["amount_rub"] > 0
            and (args.category is None or o["category"] == args.category)]
     if not ops:
         raise ToolError("not_found", "Нет операций за этот период и категорию",
                         "Уточни период или категорию у клиента")
-    by_cat: dict[str, list[float]] = defaultdict(list)
+    by_cat: dict[str, list[Decimal]] = defaultdict(list)
     for o in ops:
         by_cat[o["category"]].append(o["amount_rub"])
     return {
         "period": {"from": args.date_from.isoformat(), "to": args.date_to.isoformat()},
-        "total_rub": round(sum(o["amount_rub"] for o in ops), 2),   # сумму считает код
+        "total_rub": float(sum((o["amount_rub"] for o in ops), Decimal("0"))),   # сумму считает код
         "operations_count": len(ops),
-        "by_category": [{"category": c, "total_rub": round(sum(v), 2), "count": len(v)}
+        "by_category": [{"category": c, "total_rub": float(sum(v, Decimal("0"))), "count": len(v)}
                         for c, v in sorted(by_cat.items())],
     }
 
@@ -117,13 +125,14 @@ def get_spending_summary(args: GetSpendingSummary, session: Session) -> dict:
 def _recurring(ops: list[dict], min_months: int) -> list[dict]:
     groups: dict[tuple, list[dict]] = defaultdict(list)
     for o in ops:
-        groups[(o["merchant"], o["amount_rub"])].append(o)
+        if o["amount_rub"] > 0:
+            groups[(o["merchant"], o["amount_rub"])].append(o)
     out = []
     for (merchant, amount), items in groups.items():
         months = {(o["date"].year, o["date"].month) for o in items}
         if len(months) >= min_months:
-            out.append({"subscription_id": _sub_id(merchant), "merchant": merchant,
-                        "amount_rub": amount, "months": len(months),
+            out.append({"subscription_id": _sub_id(merchant, amount), "merchant": merchant,
+                        "amount_rub": float(amount), "months": len(months),
                         "last_date": max(o["date"] for o in items).isoformat()})
     return sorted(out, key=lambda x: x["merchant"])
 
@@ -132,13 +141,16 @@ def find_recurring_payments(args: FindRecurringPayments, session: Session) -> di
     ops = load_operations(session)
     seen: dict[tuple, int] = defaultdict(int)
     for o in ops:
-        seen[(o["merchant"], o["amount_rub"], o["date"])] += 1
-    dups = [{"merchant": m, "amount_rub": a, "date": d.isoformat(), "times": n}
+        if o["amount_rub"] > 0:
+            seen[(o["merchant"], o["amount_rub"], o["date"])] += 1
+    dups = [{"merchant": m, "amount_rub": float(a), "date": d.isoformat(), "times": n}
             for (m, a, d), n in seen.items() if n > 1]
     recurring = _recurring(ops, args.min_months)
     return {"recurring": recurring[:MAX_ITEMS],
             "possible_duplicates": dups[:MAX_ITEMS],
-            "note": f"показано до {MAX_ITEMS} записей"}
+            "recurring_total": len(recurring),
+            "duplicates_total": len(dups),
+            "note": f"Показано до {MAX_ITEMS} записей в каждом списке"}
 
 
 def flag_subscription(args: FlagSubscription, session: Session) -> dict:
@@ -165,7 +177,7 @@ class ToolSpec:
 TOOLS: dict[str, ToolSpec] = {
     "get_spending_summary": ToolSpec(
         GetSpendingSummary, get_spending_summary, "read",
-        "Возвращает траты клиента за период: общую сумму, число операций и разбивку по "
+        "Возвращает расходы (положительные суммы в синтетической CSV) клиента за период: общую сумму, число операций и разбивку по "
         "категориям. Используй для вопросов «сколько я потратил на X за период». Не "
         "используй для поиска подписок, для этого есть find_recurring_payments. Даты в "
         "формате YYYY-MM-DD. Если период не назван, спроси клиента."),
@@ -177,7 +189,7 @@ TOOLS: dict[str, ToolSpec] = {
         "категориям. Если клиент не уточнил, бери min_months=3."),
     "flag_subscription": ToolSpec(
         FlagSubscription, flag_subscription, "action",
-        "Помечает подписку клиента как «отменить». Меняет данные, поэтому перед "
+        "Помечает подписку клиента к отмене ТОЛЬКО в текущей сессии, не отменяет списания в банке. Меняет данные, поэтому перед "
         "выполнением клиент подтвердит действие. Используй только после просьбы клиента, "
         "subscription_id бери из find_recurring_payments."),
 }
