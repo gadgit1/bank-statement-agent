@@ -1,0 +1,6 @@
+# Model selection does not require changes to Python code.
+provider: gigachat
+model: GigaChat-2-Pro
+# Synthetic account and CSV for HW1 (no real banking data).
+account_id: demo-account
+statement_path: data/sample_statement.csv
